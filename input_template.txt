@@ -1,0 +1,21 @@
+# sample information
+INPUT_BAM=../../../../../../Illumina_Run_Data/251128_VL00682_14_AAFCHVGM5/Analysis/2/Data/PT1/enrich_seq/PT1.bam,../../../../../../Illumina_Run_Data/251128_VL00682_14_AAFCHVGM5/Analysis/2/Data/PT2/enrich_seq/PT2.bam
+SAMPLE_NAME=PT1,PT2
+SAMPLE_SEX=M,M
+SAMPLE_PREFIX=gednapPT
+
+# software paths - PileupCaller
+PILEUPCALLER_BIN=/home/admin7995/pileupCaller-linux
+
+# software paths - Imputation
+GLIMPSE_BIN=/home/admin7995/GLIMPSE2
+PLINK_BIN=/home/admin7995/plink19/plink
+
+# software paths - PCA
+PLINK_BIN=/home/admin7995/plink19/plink
+CONVERTF_BIN=/home/admin7995/EIG-8.0.0/bin/convertf
+SMARTPCA_BIN=/home/admin7995/EIG-8.0.0/bin/smartpca
+
+# software paths - Admixture
+PLINK_BIN=/home/admin7995/plink19/plink
+ADMIXTURE_BIN=/home/admin7995/admixture_linux-1.3.0/admixture
