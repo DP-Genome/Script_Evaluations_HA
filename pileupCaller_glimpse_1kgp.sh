@@ -1,5 +1,11 @@
 #!/bin/bash
+# Version: 1.0.1 (1000 Genomes-only GLIMPSE2 reference panel; chrX still uses hgdp1kgp)
+#   1.0.1 - fixed admixture/PCA prefix bugs with --prune ldprio|indep, single seed shared by all
+#           pileupCaller outputs, --cores option (replaces hard-coded threads), safe config
+#           loader (no eval), input validation, exported log_msg in all variants.
+#   1.0.0 - initial tagged release (see OLD_VERSION_SCRIPTS/)
 set -euo pipefail
+VERSION="1.0.1"
 
 # ======== Logger setup ========
 LOG_FILE="pipeline_$(date +%Y%m%d_%H%M%S).log"
@@ -9,11 +15,12 @@ log_msg() {
     local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
     echo "[$timestamp] $msg" | tee -a "$LOG_FILE"
 }
-export log_msg
+export -f log_msg
 # ======== Set fixed paths ========
 REF_DIR="/mnt/server_share/Hanan/human_pipeline/References"
 
 # ======== Software discovery ========
+log_msg "pileupCaller_glimpse_1kgp.sh version ${VERSION}"
 log_msg "Discovering software tools..."
 SOFTWARES_DIR="${REF_DIR}/softwares"
 
@@ -53,6 +60,13 @@ GLIMPSE1_LIGATE=$(find "$SOFTWARES_DIR"/GLIMPSE1 -name "GLIMPSE_ligate_static" -
 CONVERTF_BIN=$(find "$SOFTWARES_DIR"/EIG-8.0.0 -name "convertf" -type f -executable | head -n 1)
 SMARTPCA_BIN=$(find "$SOFTWARES_DIR"/EIG-8.0.0 -name "smartpca" -type f -executable | head -n 1)
 
+for tool_var in GLIMPSE2_PHASE GLIMPSE2_LIGATE GLIMPSE1_PHASE GLIMPSE1_LIGATE CONVERTF_BIN SMARTPCA_BIN; do
+    if [[ -z "${!tool_var}" ]]; then
+        log_msg "ERROR: could not find $tool_var under $SOFTWARES_DIR."
+        exit 1
+    fi
+done
+
 log_msg "Software discovery completed."
 
 # ======= Process arguments =======
@@ -64,7 +78,11 @@ PANEL="wgs"
 IMPUTE="false"
 PLOT="false"
 XCHR="true"
-THREADS=2
+THREADS=2      # threads per GLIMPSE chunk job
+CORES=24       # total cores for samtools, bcftools, smartpca and admixture
+PRUNE="ldprio"
+SEED=12345     # one seed shared by all pileupCaller runs so EIGENSTRAT/PLINK/VCF agree
+export CORES PRUNE
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -75,13 +93,22 @@ while [[ $# -gt 0 ]]; do
         --plot)      PLOT="$2";       shift 2 ;;
         --xchr)      XCHR="$2";       shift 2 ;;
         --threads)   THREADS="$2";    shift 2 ;;
+        --cores)     CORES="$2";      shift 2 ;;
+        --prune)     PRUNE="$2";      shift 2 ;;
+        --seed)      SEED="$2";       shift 2 ;;
+        --version)   echo "$VERSION"; exit 0 ;;
         --help)
-            echo "Usage: $0 --input file.txt --pseudoHap true|false --panel twist|wgs --impute true|false --plot false|pca|admixture|both --xchr true|false --threads 2"
+            echo "Usage: $0 --input file.txt --pseudoHap true|false --panel twist|wgs --impute true|false --plot false|pca|admixture|both --xchr true|false --prune indep|ldprio --threads 2 --cores 24 --seed 12345 [--version]"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# Validate option values
+case "$PLOT"  in false|pca|admixture|both) ;; *) log_msg "Error: --plot must be false|pca|admixture|both"; exit 1 ;; esac
+case "$PRUNE" in indep|ldprio) ;;             *) log_msg "Error: --prune must be indep|ldprio"; exit 1 ;; esac
+case "$PANEL" in wgs|twist) ;;                *) log_msg "Error: --panel must be twist|wgs"; exit 1 ;; esac
 
 # STEP 2: Validate input/config file
 if [[ -z "$INPUT_FILE" ]]; then
@@ -99,11 +126,23 @@ log_msg "Loading parameters from $INPUT_FILE..."
 while IFS='=' read -r key value || [[ -n "$key" ]]; do
     [[ $key =~ ^# ]] && continue   # skip comments
     [[ -z $key ]] && continue      # skip empty lines
-    # Trim potential whitespace and carriage returns
-    key=$(echo "$key" | xargs)
-    value=$(echo "$value" | xargs)
-    eval "$key=\"$value\""
+    # Trim surrounding whitespace and carriage returns (no eval, no xargs)
+    key="${key//$'\r'/}";     key="${key#"${key%%[![:space:]]*}"}";     key="${key%"${key##*[![:space:]]}"}"
+    value="${value//$'\r'/}"; value="${value#"${value%%[![:space:]]*}"}"; value="${value%"${value##*[![:space:]]}"}"
+    [[ -z "$key" ]] && continue
+    if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        log_msg "Error: invalid variable name '$key' in $INPUT_FILE"
+        exit 1
+    fi
+    printf -v "$key" '%s' "$value"
 done < "$INPUT_FILE"
+
+for req in INPUT_BAM SAMPLE_NAME SAMPLE_PREFIX; do
+    if [[ -z "${!req:-}" ]]; then
+        log_msg "Error: $req is missing from $INPUT_FILE"
+        exit 1
+    fi
+done
 
 # STEP 4: Clean the input bam and save in list
 log_msg "Filtering BAM files..."
@@ -116,12 +155,19 @@ BAM_LIST="bam_list.txt"
 IFS=',' read -ra ADDR <<< "$INPUT_BAM"
 
 # Loop through the resulting array
+declare -A SEEN_BAM_NAMES=()
 for input_bam in "${ADDR[@]}"; do
     filename=$(basename "$input_bam")
     output_bam="$BAM_DIR/${filename%.bam}_filtered.bam"
 
+    if [[ -n "${SEEN_BAM_NAMES[$filename]:-}" ]]; then
+        log_msg "ERROR: duplicate BAM file name '$filename' would overwrite its filtered output in $BAM_DIR."
+        exit 1
+    fi
+    SEEN_BAM_NAMES[$filename]=1
+
     log_msg "Processing $input_bam -> $output_bam"
-    $SAMTOOLS view -@ 48 -b -h -F 0x400 -q 30 -o "$output_bam" "$input_bam" &>> "$LOG_FILE"
+    $SAMTOOLS view -@ "$CORES" -b -h -F 0x400 -q 30 -o "$output_bam" "$input_bam" &>> "$LOG_FILE"
     echo "./$output_bam" >> "$BAM_LIST"
     $SAMTOOLS index "$output_bam" &>> "$LOG_FILE"
 done
@@ -154,16 +200,17 @@ if [[ "$PSEUDOHAP" == "true" ]]; then
 
     MPILEUP_CMD="$SAMTOOLS mpileup -B -R -q 25 -Q 20 -f $FASTA_REF -b $BAM_LIST -l $BED_FILE"
 
-    log_msg "Running PileupCaller for EigenStrat output..."
-    ($MPILEUP_CMD | grep -v "^chrM" | $PILEUPCALLER_BIN --randomHaploid --sampleNames "$SAMPLE_NAME" \
+    # The same --seed is used for every output format so all three contain identical calls
+    log_msg "Running PileupCaller for EigenStrat output (seed $SEED)..."
+    ($MPILEUP_CMD | grep -v "^chrM" | $PILEUPCALLER_BIN --randomHaploid --seed "$SEED" --sampleNames "$SAMPLE_NAME" \
         --samplePopName pseudo --snpFile "$SNP_FILE" --eigenstratOut "${PILEUP_CALLER_DIR}/${SAMPLE_PREFIX}") &>> "$LOG_FILE"
 
     # Rename chromosomes and positions in SNP file
     awk 'BEGIN{OFS="\t"} {gsub(/^chr/, "", $2); $1=$2"_"$4; print}' \
         "${PILEUP_CALLER_DIR}/${SAMPLE_PREFIX}.snp" > tmp && mv tmp "${PILEUP_CALLER_DIR}/${SAMPLE_PREFIX}.snp"
 
-    log_msg "Running PileupCaller for PLINK output..."
-    ($MPILEUP_CMD | grep -v "^chrM" | $PILEUPCALLER_BIN --randomHaploid --sampleNames "$SAMPLE_NAME" \
+    log_msg "Running PileupCaller for PLINK output (seed $SEED)..."
+    ($MPILEUP_CMD | grep -v "^chrM" | $PILEUPCALLER_BIN --randomHaploid --seed "$SEED" --sampleNames "$SAMPLE_NAME" \
         --samplePopName pseudo --snpFile "$SNP_FILE" --plinkOut "${PILEUP_CALLER_DIR}/${SAMPLE_PREFIX}") &>> "$LOG_FILE"
 
     # Rename chromosomes and positions in BIM file
@@ -173,8 +220,8 @@ if [[ "$PSEUDOHAP" == "true" ]]; then
     # create an autosomal version for plotting
     $PLINK_BIN --bfile "${PILEUP_CALLER_DIR}/${SAMPLE_PREFIX}" --not-chr X --make-bed --out "${PILEUP_CALLER_DIR}/${SAMPLE_PREFIX}_noX" &>> "$LOG_FILE"
 
-    log_msg "Running PileupCaller for VCF output..."
-    ($MPILEUP_CMD | grep -v "^chrM" | $PILEUPCALLER_BIN --randomHaploid --sampleNames "$SAMPLE_NAME" --samplePopName pseudoHaploid \
+    log_msg "Running PileupCaller for VCF output (seed $SEED)..."
+    ($MPILEUP_CMD | grep -v "^chrM" | $PILEUPCALLER_BIN --randomHaploid --seed "$SEED" --sampleNames "$SAMPLE_NAME" --samplePopName pseudoHaploid \
     --snpFile "$SNP_FILE" --vcf | $BGZIP > "${PILEUP_CALLER_DIR}/${SAMPLE_PREFIX}.vcf.gz") &>> "$LOG_FILE"
     $TABIX -p vcf "${PILEUP_CALLER_DIR}/${SAMPLE_PREFIX}.vcf.gz" &>> "$LOG_FILE"
 
@@ -347,7 +394,7 @@ if [[ "$IMPUTE" == "true" ]]; then
     # apply mask
     MASK_BED="${REF_DIR}/hgdp_references/hgdp_wgs.20190516.mask.bed"
     MASKED_BCF="${IMPUTED_SAMPLE_DIR}/imputed_${SAMPLE_PREFIX}_masked.bcf"
-    $BCFTOOLS view --regions-file "$MASK_BED" --threads 24 -Ob -o "$MASKED_BCF" "$OUT_CONCAT_BCF" &>> "$LOG_FILE"
+    $BCFTOOLS view --regions-file "$MASK_BED" --threads "$CORES" -Ob -o "$MASKED_BCF" "$OUT_CONCAT_BCF" &>> "$LOG_FILE"
     $BCFTOOLS index "$MASKED_BCF" &>> "$LOG_FILE"
 
     # filter for biallelic snps only
@@ -376,7 +423,7 @@ if [[ "$IMPUTE" == "true" ]]; then
 if [[ "$PLOT" != "false" ]]; then
     log_msg "Launching PCA/Admixture analysis..."
     # Export discovered bins for sub-script
-    export PLINK_BIN CONVERTF_BIN SMARTPCA_BIN ADMIXTURE_BIN
+    export PLINK_BIN CONVERTF_BIN SMARTPCA_BIN ADMIXTURE_BIN CORES PRUNE
     source "${REF_DIR}/../Pipelines/pca_admixture.sh"
 fi
 

@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
+# Version: 1.0.1
+#   1.0.1 - PCA/Admixture use the pruned set that matches --prune (ldprio or indep);
+#           new-sample list no longer hard-coded to line 930; admixture runs in its own
+#           directory (no more moving *.log); threads come from $CORES; PRUNE/PLOT defaults.
+#   1.0.0 - initial tagged release (see OLD_VERSION_SCRIPTS/)
 
 set -euo pipefail
+: "${PRUNE:=ldprio}"
+: "${PLOT:=both}"
+: "${CORES:=24}"
 
 # ======== Logger and Software Discovery ========
 # These variables should be exported from the calling script (pileupCaller_glimpse.sh)
@@ -37,6 +45,13 @@ mkdir -p "merged_plink"
 PLINK_MERGED_PREFIX="./merged_plink/merged_ref"
 PLINK_MERGED_PREFIX_LDPRIO="./merged_plink_ldprio/merged_ref"
 
+# Prefix of the pruned fileset used by PCA and Admixture (depends on --prune)
+case "$PRUNE" in
+    indep)  PAR_PREFIX="${PLINK_MERGED_PREFIX}_pruned" ;;
+    ldprio) PAR_PREFIX="${PLINK_MERGED_PREFIX_LDPRIO}_ldprioPruned" ;;
+    *) log_msg "ERROR: PRUNE must be indep or ldprio (got '$PRUNE')"; exit 1 ;;
+esac
+
 # STEP 2: Create list of plink files to be merged with reference
 log_msg "Creating merge_list.txt..."
 MERGE_LIST="merge_list.txt"
@@ -65,14 +80,20 @@ if [[ "$PRUNE" == "indep" ]]; then
     $PLINK_BIN --bfile "${PLINK_MERGED_PREFIX}" --extract "${PLINK_MERGED_PREFIX}_pruned.prune.in" --make-bed --out "${PLINK_MERGED_PREFIX}_pruned" &>> "$LOG_FILE"
 fi
 
+# Samples added on top of the reference panel (= in the merged .fam but not in the reference .fam)
+mkdir -p "merged_plink_ldprio"
+LDPRIO_SAMPLES="./merged_plink_ldprio/ldprioSamples.txt"
+awk 'NR==FNR { ref[$1 "\t" $2]; next } !(($1 "\t" $2) in ref) { print $1 "\t" $2 }' \
+    "${REF_PLINK_PREFIX}.fam" "${PLINK_MERGED_PREFIX}.fam" > "$LDPRIO_SAMPLES"
+if [[ ! -s "$LDPRIO_SAMPLES" ]]; then
+    log_msg "ERROR: no new samples found after merging with the reference."
+    exit 1
+fi
+log_msg "New (non-reference) samples: $(wc -l < "$LDPRIO_SAMPLES")"
+
 if [[ "$PRUNE" == "ldprio" ]]; then
 
     log_msg "Performing ldprio pruning..."
-    mkdir -p "merged_plink_ldprio"
-
-    LDPRIO_SAMPLES="./merged_plink_ldprio/ldprioSamples.txt"
-    > "$LDPRIO_SAMPLES" # clear existing file
-    awk 'NR>=930 {print $1 "\t" $2}' "${PLINK_MERGED_PREFIX}.fam" > "$LDPRIO_SAMPLES" # start from line 930
 
     python3 "${REF_DIR}/softwares/ldprio.py" --bfile "${PLINK_MERGED_PREFIX}" --priority-samples "${LDPRIO_SAMPLES}" \
         --ld-samples "${REF_DIR}/hgdp_references/modernSamples.txt" --autosomes-only --make-bed --out "${PLINK_MERGED_PREFIX_LDPRIO}_ldprioPruned"
@@ -98,15 +119,6 @@ if [[ "$PLOT" == "pca" || "$PLOT" == "both" ]]; then
     PAR_PCA_CONVERTF_CI="par_pca_CI.convertf"
     PAR_SMARTPCA_CI="par_CI.smartpcaProject"
 
-    # define par file prefix
-    if [[ "$PRUNE" == "indep" ]]; then
-    PAR_PREFIX="${PLINK_MERGED_PREFIX}_pruned"
-    fi
-
-    if [[ "$PRUNE" == "ldprio" ]]; then
-    PAR_PREFIX="${PLINK_MERGED_PREFIX_LDPRIO}_ldprioPruned"
-    fi
-
     # for smart pca without confidence ellipses
     log_msg "Generating parameter files..."
     cat <<EOF > $PAR_PCA_CONVERTF
@@ -130,7 +142,7 @@ EOF
     newshrink: YES
     numoutlieriter: 0
     numoutevec: 10
-    numthreads: 36
+    numthreads: ${CORES}
 EOF
 
     # for smart pca with confidence ellipses
@@ -160,7 +172,7 @@ EOF
     elllistname:  ./smart_pca_CI/sampleList_CI.txt
     elloutname:  confEllipses
     ellconf:  0.95
-    numthreads: 24
+    numthreads: ${CORES}
 EOF
 
     # convert
@@ -218,9 +230,9 @@ EOF
         # Reorder evec: HGDP first, then targets
         (
             grep "^[[:space:]]*#" "${PREFIX}_labeled.evec"
-            grep "[[:space:]]HGDP" "${PREFIX}_labeled.evec"
+            grep "[[:space:]]HGDP" "${PREFIX}_labeled.evec" || true
             grep -v "^[[:space:]]*#" "${PREFIX}_labeled.evec" \
-                | grep -v "[[:space:]]HGDP"
+                | grep -v "[[:space:]]HGDP" || true
         ) > "${PREFIX}_labeled_ordered.evec"
 
         mv "${PREFIX}_labeled_ordered.evec" "${PREFIX}_labeled.evec"
@@ -234,24 +246,25 @@ fi
 # ======== PART 3: Plot Admixture ========
 
 if [[ "$PLOT" == "admixture" || "$PLOT" == "both" ]]; then
-    log_msg "PART 3: Running Admixture..."
+    log_msg "PART 3: Running Admixture on ${PAR_PREFIX}..."
 
     ADMIXTURE_DIR="./admixture"
     mkdir -p "$ADMIXTURE_DIR"
     ADMIXTURE_LABELS_REF="${REF_DIR}/hgdp_references/hgdp_population/admixture_labels.txt"
 
+    # Admixture writes its .Q/.P files into the current directory, so run it inside ADMIXTURE_DIR
+    ADMIX_INPUT="$(realpath "${PAR_PREFIX}.bed")"
+    ADMIX_FAM="$(realpath "${PAR_PREFIX}.fam")"
+
     log_msg "Running Admixture for K=5 to 14..."
+    : > "${ADMIXTURE_DIR}/cv_comparison.txt"
     for k in {5..14}; do
         log_msg "  Processing K=$k"
-        $ADMIXTURE_BIN -j120 --cv "${PLINK_MERGED_PREFIX}_pruned.bed" $k &>> "$LOG_FILE"
+        (cd "$ADMIXTURE_DIR" && "$ADMIXTURE_BIN" -j"${CORES}" --cv "$ADMIX_INPUT" "$k") > "${ADMIXTURE_DIR}/admixture_K${k}.log" 2>&1
+        grep '^CV error' "${ADMIXTURE_DIR}/admixture_K${k}.log" >> "${ADMIXTURE_DIR}/cv_comparison.txt" || true
     done
-    grep '^CV error' "$LOG_FILE" | grep 'K=' > cv_comparison.txt || true
 
     log_msg "Fixing Admixture labels..."
-    # Create a lookup for all possible samples
-    TMP_LABELS="${ADMIXTURE_DIR}/tmp_admixture_labels.txt"
-    cp "$ADMIXTURE_LABELS_REF" "$TMP_LABELS"
-
     # Generate the label file in the EXACT order of the .fam file used for Admixture
     RUN_LABELS="${ADMIXTURE_DIR}/run_order_labels.txt"
     awk '
@@ -273,20 +286,17 @@ if [[ "$PLOT" == "admixture" || "$PLOT" == "both" ]]; then
         g  = (iid in gender) ? gender[iid] : "U"
         print label "\t" sp "\t" p "\t" g
     }
-    ' "$TMP_LABELS" "${PLINK_MERGED_PREFIX}_pruned.fam" > "$RUN_LABELS"
+    ' "$ADMIXTURE_LABELS_REF" "$ADMIX_FAM" > "$RUN_LABELS"
 
     log_msg "Annotating .Q files..."
-    for Qfile in *.Q; do
-        paste "$RUN_LABELS" "$Qfile" > "${Qfile}.withPop"
-        # Reorder Admixture output: HGDP first, then targets
-        (grep "HGDP" "${Qfile}.withPop"; grep -v "HGDP" "${Qfile}.withPop") > "${Qfile}.withPop.tmp"
-        mv "${Qfile}.withPop.tmp" "${Qfile}.withPop"
-    done
-
     mkdir -p "${ADMIXTURE_DIR}/Qfiles_withpop"
-    mv *withPop "${ADMIXTURE_DIR}/Qfiles_withpop/"
-    mv *.{P,Q,log} "$ADMIXTURE_DIR/" && mv cv_comparison.txt "$ADMIXTURE_DIR/"
-    rm "$TMP_LABELS"
+    for Qfile in "${ADMIXTURE_DIR}"/*.Q; do
+        out="${ADMIXTURE_DIR}/Qfiles_withpop/$(basename "$Qfile").withPop"
+        paste "$RUN_LABELS" "$Qfile" > "${out}.tmp"
+        # Reorder Admixture output: HGDP first, then targets
+        (grep "HGDP" "${out}.tmp" || true; grep -v "HGDP" "${out}.tmp" || true) > "$out"
+        rm -f "${out}.tmp"
+    done
 
     log_msg "Admixture analysis completed."
 fi
