@@ -2,22 +2,43 @@
 
 set -euo pipefail
 
+# ======== Logger and Software Discovery ========
+# These variables should be exported from the calling script (pileupCaller_glimpse.sh)
+# If not, we attempt to find them here for standalone execution.
+
+if ! command -v log_msg >/dev/null 2>&1; then
+    LOG_FILE="${LOG_FILE:-pca_admixture_$(date +%Y%m%d_%H%M%S).log}"
+    log_msg() {
+        echo "[$(date "+%Y-%m-%d %H:%M:%S")] $1" | tee -a "$LOG_FILE"
+    }
+fi
+
+SOFTWARES_DIR="../References/softwares"
+find_tool() {
+    local name="$1"
+    local path=$(find "$SOFTWARES_DIR" -name "$name" -type f -executable | head -n 1)
+    [[ -z "$path" ]] && echo "$name" || echo "$path"
+}
+
+: "${PLINK_BIN:=$(find_tool "plink")}"
+: "${CONVERTF_BIN:=$(find_tool "convertf")}"
+: "${SMARTPCA_BIN:=$(find_tool "smartpca")}"
+: "${ADMIXTURE_BIN:=$(find_tool "admixture")}"
+
 # ======= PART 1: Create the merged plink files =======
 
-# STEP 1: set file paths
+log_msg "PART 1: Creating merged PLINK files..."
 
 # Reference plink prefix
 REF_PLINK_PREFIX="${REF_DIR}/hgdp_references/plink_files/hgdp_all_chr"
-# output dir
-mkdir -p "merged_plink"
-# PLINK sample/reference merged output
-PLINK_MERGED_PREFIX="./merged_plink/merged_ref"
 
+# PLINK sample/reference merged output
+mkdir -p "merged_plink"
+PLINK_MERGED_PREFIX="./merged_plink/merged_ref"
+PLINK_MERGED_PREFIX_LDPRIO="./merged_plink_ldprio/merged_ref"
 
 # STEP 2: Create list of plink files to be merged with reference
-echo
-echo "Creating merge_list.txt..."
-echo
+log_msg "Creating merge_list.txt..."
 MERGE_LIST="merge_list.txt"
 > "$MERGE_LIST"
 
@@ -31,157 +52,241 @@ fi
 
 # check list
 if [[ ! -s "$MERGE_LIST" ]]; then
-    echo "ERROR: merge list is empty. Nothing to merge." >&2
+    log_msg "ERROR: merge list is empty. Nothing to merge." >&2
     exit 1
 fi
-echo
-echo "Merging the following datasets:"
-cat "$MERGE_LIST"
+log_msg "Merging sample datasets with HGDP reference..."
+$PLINK_BIN --bfile "$REF_PLINK_PREFIX" --merge-list "$MERGE_LIST" --make-bed --out "${PLINK_MERGED_PREFIX}" &>> "$LOG_FILE"
 
-# STEP 3: Merge plinks
-echo
-echo "Merging step 1/2: Merging sample with reference plink files..."
-echo "--------------------------------------------------------------"
-$PLINK_BIN --bfile "$REF_PLINK_PREFIX" --merge-list "$MERGE_LIST" --make-bed --out "${PLINK_MERGED_PREFIX}"
-echo
-echo "Merging step 2/2: Performing LD pruning"
-echo "-------------------------------"
-echo "Pruning..."
-$PLINK_BIN --bfile "${PLINK_MERGED_PREFIX}" --indep-pairwise 50 5 0.2 --out "${PLINK_MERGED_PREFIX}_pruned"
-$PLINK_BIN --bfile "${PLINK_MERGED_PREFIX}" --extract "${PLINK_MERGED_PREFIX}_pruned.prune.in" --make-bed --out "${PLINK_MERGED_PREFIX}_pruned"
+if [[ "$PRUNE" == "indep" ]]; then
+    log_msg "Performing LD pruning (r2 > 0.2)..."
+    # save pruned output in the same file as the plink files
+    $PLINK_BIN --bfile "${PLINK_MERGED_PREFIX}" --maf 0.01 --geno 0.05 --indep-pairwise 50 5 0.2 --out "${PLINK_MERGED_PREFIX}_pruned" &>> "$LOG_FILE"
+    $PLINK_BIN --bfile "${PLINK_MERGED_PREFIX}" --extract "${PLINK_MERGED_PREFIX}_pruned.prune.in" --make-bed --out "${PLINK_MERGED_PREFIX}_pruned" &>> "$LOG_FILE"
+fi
 
+if [[ "$PRUNE" == "ldprio" ]]; then
+
+    log_msg "Performing ldprio pruning..."
+    mkdir -p "merged_plink_ldprio"
+
+    LDPRIO_SAMPLES="./merged_plink_ldprio/ldprioSamples.txt"
+    > "$LDPRIO_SAMPLES" # clear existing file
+    awk 'NR>=930 {print $1 "\t" $2}' "${PLINK_MERGED_PREFIX}.fam" > "$LDPRIO_SAMPLES" # start from line 930
+
+    python3 "${REF_DIR}/softwares/ldprio.py" --bfile "${PLINK_MERGED_PREFIX}" --priority-samples "${LDPRIO_SAMPLES}" \
+        --ld-samples "${REF_DIR}/hgdp_references/modernSamples.txt" --autosomes-only --make-bed --out "${PLINK_MERGED_PREFIX_LDPRIO}_ldprioPruned"
+fi
 # ======== PART 2: Plot PCA ========
 
 if [[ "$PLOT" == "pca" || "$PLOT" == "both" ]]; then
-    echo
-    echo "Runnin smart PCA..."
-    echo
+    log_msg "PART 2: Running SmartPCA..."
 
     # Population list to project on
-    POPULATION_LIST="${REF_DIR}/hgdp_references/hgdp_population/populationList.txt"
-    SUBPOPULATION_LIST="${REF_DIR}/hgdp_references/hgdp_population/subpopulationList.txt"
+    POP_LIST_REF="${REF_DIR}/hgdp_references/hgdp_population/populationList.txt"
+    SUBPOP_LIST_REF="${REF_DIR}/hgdp_references/hgdp_population/subpopulationList.txt"
+    LABELS_REF="${REF_DIR}/hgdp_references/hgdp_population/population_labels.tsv"
 
     # Define output paths
-    mkdir -p "smart_pca"
+    mkdir -p "smart_pca" "smart_pca_CI"
     PCA_MERGED_PREFIX="./smart_pca/merged_ref"
+    PCA_MERGED_PREFIX_CI="./smart_pca_CI/merged_ref"
 
     # Define parameter files to be generated
     PAR_PCA_CONVERTF="par_pca.convertf"
     PAR_SMARTPCA="par.smartpcaProject"
+    PAR_PCA_CONVERTF_CI="par_pca_CI.convertf"
+    PAR_SMARTPCA_CI="par_CI.smartpcaProject"
 
-    echo "=== Generating convertf parameter file: $PAR_PCA_CONVERTF ==="
+    # define par file prefix
+    if [[ "$PRUNE" == "indep" ]]; then
+    PAR_PREFIX="${PLINK_MERGED_PREFIX}_pruned"
+    fi
+
+    if [[ "$PRUNE" == "ldprio" ]]; then
+    PAR_PREFIX="${PLINK_MERGED_PREFIX_LDPRIO}_ldprioPruned"
+    fi
+
+    # for smart pca without confidence ellipses
+    log_msg "Generating parameter files..."
     cat <<EOF > $PAR_PCA_CONVERTF
-    genotypename:       ${PLINK_MERGED_PREFIX}_pruned.bed
-    snpname:            ${PLINK_MERGED_PREFIX}_pruned.bim
-    indivname:          ${PLINK_MERGED_PREFIX}_pruned.fam
+    genotypename:       ${PAR_PREFIX}.bed
+    snpname:            ${PAR_PREFIX}.bim
+    indivname:          ${PAR_PREFIX}.fam
     outputformat:       EIGENSTRAT
     genotypeoutname:    ${PCA_MERGED_PREFIX}.geno
     snpoutname:         ${PCA_MERGED_PREFIX}.snp
     indivoutname:       ${PCA_MERGED_PREFIX}.ind
 EOF
 
-    echo "=== Generating smartpca parameter file: $PAR_SMARTPCA ==="
     cat <<EOF > $PAR_SMARTPCA
     genotypename: ${PCA_MERGED_PREFIX}.geno
     snpname:      ${PCA_MERGED_PREFIX}.snp
     indivname:    ${PCA_MERGED_PREFIX}_withPop.ind
-    poplistname:  ${POPULATION_LIST}
+    poplistname:  ${POP_LIST_REF}
     evecoutname:  ${PCA_MERGED_PREFIX}.evec
     evaloutname:  ${PCA_MERGED_PREFIX}.eval
     lsqproject: YES
-    shrink mode: YES
+    newshrink: YES
     numoutlieriter: 0
     numoutevec: 10
+    numthreads: 36
+EOF
+
+    # for smart pca with confidence ellipses
+    log_msg "Generating parameter files..."
+    cat <<EOF > $PAR_PCA_CONVERTF_CI
+    genotypename:       ${PAR_PREFIX}.bed
+    snpname:            ${PAR_PREFIX}.bim
+    indivname:          ${PAR_PREFIX}.fam
+    outputformat:       EIGENSTRAT
+    genotypeoutname:    ${PCA_MERGED_PREFIX_CI}.geno
+    snpoutname:         ${PCA_MERGED_PREFIX_CI}.snp
+    indivoutname:       ${PCA_MERGED_PREFIX_CI}.ind
+EOF
+
+    awk '{print $1 ":" $2}' "$LDPRIO_SAMPLES" > ./smart_pca_CI/sampleList_CI.txt
+    cat <<EOF > $PAR_SMARTPCA_CI
+    genotypename: ${PCA_MERGED_PREFIX_CI}.geno
+    snpname:      ${PCA_MERGED_PREFIX_CI}.snp
+    indivname:    ${PCA_MERGED_PREFIX_CI}_withPop.ind
+    poplistname:  ${POP_LIST_REF}
+    evecoutname:  ${PCA_MERGED_PREFIX_CI}_CI.evec
+    evaloutname:  ${PCA_MERGED_PREFIX_CI}_CI.eval
+    lsqproject: YES
+    newshrink: YES
+    numoutlieriter: 0
+    numoutevec: 2
+    elllistname:  ./smart_pca_CI/sampleList_CI.txt
+    elloutname:  confEllipses
+    ellconf:  0.95
     numthreads: 24
 EOF
 
-    #  Run smart PCA
-    echo
-    echo "PCA step 1/2: Converting to EIGENSTRAT geno/snp/ind format..."
-    echo "-------------------------------------------------------------"
-    $CONVERTF_BIN -p "$PAR_PCA_CONVERTF"
-    echo
-    echo "Assigning population labels..."
-    awk 'NR==FNR { pop[$1]=$2; next }          # first file: build lookup table
-        $3=="???" && ($1 in pop) { $3=pop[$1] }       # replace ??? with population if known
-        $3=="???" && !($1 in pop) { $3=$1 }  # replace ??? with sample name if unknown
+    # convert
+    log_msg "Converting to EIGENSTRAT format..."
+    $CONVERTF_BIN -p "$PAR_PCA_CONVERTF" &>> "$LOG_FILE"
+    $CONVERTF_BIN -p "$PAR_PCA_CONVERTF_CI" &>> "$LOG_FILE"
+
+    log_msg "Assigning population labels..."
+    for PREFIX in "$PCA_MERGED_PREFIX" "$PCA_MERGED_PREFIX_CI"; do
+        awk '
+        NR==FNR { pop[$1]=$2; next }
+
+        $3=="???" {
+            if ($1 in pop) {
+                $3 = pop[$1]
+            } else if (index($1, ":") > 0) {
+                split($1, a, ":")
+                $3 = a[1]
+            } else {
+                $3 = $1
+            }
+        }
         { print }
-    ' "${REF_DIR}/hgdp_references/population_labels.tsv" "${PCA_MERGED_PREFIX}.ind" > "${PCA_MERGED_PREFIX}_withPop.ind"
+        ' "$LABELS_REF" "${PREFIX}.ind" > "${PREFIX}_withPop.ind"
+    done
 
-    echo
-    echo "PCA step 2/2: Running smartPCA..."
-    echo "---------------------------------"
-    $SMARTPCA_BIN -p "$PAR_SMARTPCA"
+    # run smart PCA
+    log_msg "Executing SmartPCA..."
+    $SMARTPCA_BIN -p "$PAR_SMARTPCA" &>> "$LOG_FILE"
+    $SMARTPCA_BIN -p "$PAR_SMARTPCA_CI" &>> "$LOG_FILE"
 
-    # add the subpopultion hgdp names to the evec file
-    paste "${PCA_MERGED_PREFIX}.evec" <(awk '{print $2}' "$SUBPOPULATION_LIST") > tmp.evec
-    # same for our samples
-    awk '{
-      if ($NF ~ /:/) {
-        split($NF, a, ":");
-        print $0 "\t" a[2];
-      } else {
-        print;
-      }
-    }' tmp.evec > "${PCA_MERGED_PREFIX}_labeled.evec"
+    log_msg "Fixing PCA labels in .evec files..."
 
-    rm tmp.evec
+    for PREFIX in "$PCA_MERGED_PREFIX" "$PCA_MERGED_PREFIX_CI"; do
+        # Robustly join evec with subpopulation labels using ID lookup
+        awk '
+        NR==FNR { subpop[$1]=$2; next }
+        {
+            if ($1 ~ /^#/) { print; next }
 
+            # Split ID (e.g., imputed:firstSample)
+            if (index($1, ":") > 0) {
+                split($1, a, ":")
+                id = a[2]
+                sp = (id in subpop) ? subpop[id] : id
+            } else {
+                id = $1
+                sp = (id in subpop) ? subpop[id] : $NF
+            }
 
-    # print number of SNPs in each step
-    echo
-    echo "Counting all SNPS"
-    echo "-----------------"
-    echo "  --> HGDP reference input:" $(wc -l < "${REF_PLINK_PREFIX}.bim")
-    echo "  --> SNPs in the Pseudohaplotype:" $(wc -l < "${PILEUP_CALLER_DIR}/${SAMPLE_PREFIX}.bim")
-    echo "  --> SNPs in the imputed sample:" $(wc -l < "${IMPUTED_PLINK_DIR}/imputed_${SAMPLE_PREFIX}_filtered.bim")
-    echo "  --> Merged PLINK files:" $(wc -l < "${PLINK_MERGED_PREFIX}.bim")
-    echo "  --> After pruning (PCA input):" $(wc -l < "${PLINK_MERGED_PREFIX}_pruned.bim")
-    echo
-    echo "=== PCA FINISHED SUCCESSFULLY ==="
-    echo
+            print $0 "\t" sp
+        }
+        ' "$SUBPOP_LIST_REF" "${PREFIX}.evec" > "${PREFIX}_labeled.evec"
 
-fi # end of if [[ PLOT == pca || PLOT == both ]]
+        # Reorder evec: HGDP first, then targets
+        (
+            grep "^[[:space:]]*#" "${PREFIX}_labeled.evec"
+            grep "[[:space:]]HGDP" "${PREFIX}_labeled.evec"
+            grep -v "^[[:space:]]*#" "${PREFIX}_labeled.evec" \
+                | grep -v "[[:space:]]HGDP"
+        ) > "${PREFIX}_labeled_ordered.evec"
+
+        mv "${PREFIX}_labeled_ordered.evec" "${PREFIX}_labeled.evec"
+
+        log_msg "Final evec: ${PREFIX}_labeled.evec"
+    done
+
+    log_msg "PCA label fixing completed."
+fi
 
 # ======== PART 3: Plot Admixture ========
 
 if [[ "$PLOT" == "admixture" || "$PLOT" == "both" ]]; then
+    log_msg "PART 3: Running Admixture..."
 
-    # output dir
     ADMIXTURE_DIR="./admixture"
     mkdir -p "$ADMIXTURE_DIR"
-    # Admixture metadata file for annotation
-    ADMIXTURE_LABELS="${REF_DIR}/hgdp_references/hgdp_population/admixture_labels.txt"
-    # Define output prefix
-    ADMIXTURE_PREFIX="./$ADMIXTURE_DIR/merged_ref"
+    ADMIXTURE_LABELS_REF="${REF_DIR}/hgdp_references/hgdp_population/admixture_labels.txt"
 
-    echo
-    echo "Running Admixture..."
-    echo "--------------------"
-    echo " Converting input to PLINK..."
-    for k in {5..14}; do $ADMIXTURE_BIN -j120 --cv ${PLINK_MERGED_PREFIX}_pruned.bed $k 2>&1 | tee admixture_K${k}.log; done
-    grep '^CV error' admixture_K*.log > cv_comparison.txt
-
-    # add population labels
-    cp "$ADMIXTURE_LABELS" "${ADMIXTURE_DIR}/"
-
-    # append sample names to the labels file
-    IFS=',' read -ra SAMPLES <<< "$SAMPLE_NAME"
-    for s in "${SAMPLES[@]}"; do
-        echo -e "$s\t$s\t$s\tM" >> "${ADMIXTURE_DIR}/admixture_labels.txt"
+    log_msg "Running Admixture for K=5 to 14..."
+    for k in {5..14}; do
+        log_msg "  Processing K=$k"
+        $ADMIXTURE_BIN -j120 --cv "${PLINK_MERGED_PREFIX}_pruned.bed" $k &>> "$LOG_FILE"
     done
+    grep '^CV error' "$LOG_FILE" | grep 'K=' > cv_comparison.txt || true
 
-    # paste to each Q file
-    for Qfile in *.Q; do paste "${ADMIXTURE_DIR}/admixture_labels.txt" "$Qfile" > "${Qfile}.withPop"; done
+    log_msg "Fixing Admixture labels..."
+    # Create a lookup for all possible samples
+    TMP_LABELS="${ADMIXTURE_DIR}/tmp_admixture_labels.txt"
+    cp "$ADMIXTURE_LABELS_REF" "$TMP_LABELS"
+
+    # Generate the label file in the EXACT order of the .fam file used for Admixture
+    RUN_LABELS="${ADMIXTURE_DIR}/run_order_labels.txt"
+    awk '
+    NR==FNR {
+        subpop[$1]=$2; pop[$1]=$3; gender[$1]=$4; next
+    }
+    {
+        iid = $2
+        fid = $1
+        # Label as FID:IID for target samples (e.g., imputed:firstSample)
+        label = (fid == iid) ? iid : fid ":" iid
+        if (fid == "pseudo" || fid == "imputed") {
+            sp = iid
+            p  = fid
+        } else {
+            sp = (iid in subpop) ? subpop[iid] : iid
+            p  = (iid in pop)    ? pop[iid]    : iid
+        }
+        g  = (iid in gender) ? gender[iid] : "U"
+        print label "\t" sp "\t" p "\t" g
+    }
+    ' "$TMP_LABELS" "${PLINK_MERGED_PREFIX}_pruned.fam" > "$RUN_LABELS"
+
+    log_msg "Annotating .Q files..."
+    for Qfile in *.Q; do
+        paste "$RUN_LABELS" "$Qfile" > "${Qfile}.withPop"
+        # Reorder Admixture output: HGDP first, then targets
+        (grep "HGDP" "${Qfile}.withPop"; grep -v "HGDP" "${Qfile}.withPop") > "${Qfile}.withPop.tmp"
+        mv "${Qfile}.withPop.tmp" "${Qfile}.withPop"
+    done
 
     mkdir -p "${ADMIXTURE_DIR}/Qfiles_withpop"
     mv *withPop "${ADMIXTURE_DIR}/Qfiles_withpop/"
-    mv *.{P,Q,log} "$ADMIXTURE_DIR" && mv cv_comparison.txt "$ADMIXTURE_DIR"
+    mv *.{P,Q,log} "$ADMIXTURE_DIR/" && mv cv_comparison.txt "$ADMIXTURE_DIR/"
+    rm "$TMP_LABELS"
 
-    echo
-    echo "=== ADMIXTURE FINISHED SUCCESSFULLY ==="
-
-
-fi # end of if [[ PLOT == admixture || PLOT == both ]]
-
-
+    log_msg "Admixture analysis completed."
+fi
