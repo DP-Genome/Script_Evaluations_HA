@@ -1,5 +1,6 @@
 #!/bin/bash
-# Version: 1.2.0 (1000 Genomes-only GLIMPSE2 reference panel; chrX still uses hgdp1kgp)
+# Version: 1.3.0 (1000 Genomes-only GLIMPSE2 reference panel; chrX still uses hgdp1kgp)
+#   1.3.0 - Admixture runs K values concurrently: --admix-threads (16), --admix-parallel (5), --kmin (5), --kmax (14).
 #   1.2.0 - new --pca-evecs N (default 10) and --ci true|false (default true).
 #   1.1.1 - ldprio v1.5 compatible (see pca_admixture.sh).
 #   1.1.0 - new --transversions true|false: restrict PCA/Admixture to transversion SNPs.
@@ -8,7 +9,7 @@
 #           loader (no eval), input validation, exported log_msg in all variants.
 #   1.0.0 - initial tagged release (see OLD_VERSION_SCRIPTS/)
 set -euo pipefail
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 # ======== Logger setup ========
 LOG_FILE="pipeline_$(date +%Y%m%d_%H%M%S).log"
@@ -88,6 +89,10 @@ SEED=12345     # one seed shared by all pileupCaller runs so EIGENSTRAT/PLINK/VC
 TRANSVERSIONS="false"
 PCA_EVECS=10
 RUN_CI="true"
+ADMIX_THREADS=16
+ADMIX_PARALLEL=5
+ADMIX_KMIN=5
+ADMIX_KMAX=14
 export CORES PRUNE
 
 while [[ $# -gt 0 ]]; do
@@ -105,9 +110,13 @@ while [[ $# -gt 0 ]]; do
         --transversions) TRANSVERSIONS="$2"; shift 2 ;;
         --pca-evecs) PCA_EVECS="$2"; shift 2 ;;
         --ci)        RUN_CI="$2";    shift 2 ;;
+        --admix-threads)  ADMIX_THREADS="$2";  shift 2 ;;
+        --admix-parallel) ADMIX_PARALLEL="$2"; shift 2 ;;
+        --kmin)      ADMIX_KMIN="$2"; shift 2 ;;
+        --kmax)      ADMIX_KMAX="$2"; shift 2 ;;
         --version)   echo "$VERSION"; exit 0 ;;
         --help)
-            echo "Usage: $0 --input file.txt --pseudoHap true|false --panel twist|wgs --impute true|false --plot false|pca|admixture|both --xchr true|false --prune indep|ldprio --threads 2 --cores 24 --seed 12345 --transversions true|false --pca-evecs 10 --ci true|false [--version]"
+            echo "Usage: $0 --input file.txt --pseudoHap true|false --panel twist|wgs --impute true|false --plot false|pca|admixture|both --xchr true|false --prune indep|ldprio --threads 2 --cores 24 --seed 12345 --transversions true|false --pca-evecs 10 --ci true|false --admix-threads 16 --admix-parallel 5 --kmin 5 --kmax 14 [--version]"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -117,6 +126,10 @@ done
 # Validate option values
 case "$PLOT"  in false|pca|admixture|both) ;; *) log_msg "Error: --plot must be false|pca|admixture|both"; exit 1 ;; esac
 case "$PRUNE" in indep|ldprio) ;;             *) log_msg "Error: --prune must be indep|ldprio"; exit 1 ;; esac
+for v in ADMIX_THREADS ADMIX_PARALLEL ADMIX_KMIN ADMIX_KMAX; do
+    [[ "${!v}" =~ ^[0-9]+$ && "${!v}" -ge 1 ]] || { log_msg "Error: $v must be a positive integer"; exit 1; }
+done
+(( ADMIX_KMIN >= 2 && ADMIX_KMIN <= ADMIX_KMAX )) || { log_msg "Error: need 2 <= --kmin <= --kmax"; exit 1; }
 case "$RUN_CI" in true|false) ;; *) log_msg "Error: --ci must be true|false"; exit 1 ;; esac
 [[ "$PCA_EVECS" =~ ^[0-9]+$ && "$PCA_EVECS" -ge 2 ]] || { log_msg "Error: --pca-evecs must be an integer >= 2"; exit 1; }
 case "$TRANSVERSIONS" in true|false) ;; *) log_msg "Error: --transversions must be true|false"; exit 1 ;; esac
@@ -435,7 +448,7 @@ if [[ "$IMPUTE" == "true" ]]; then
 if [[ "$PLOT" != "false" ]]; then
     log_msg "Launching PCA/Admixture analysis..."
     # Export discovered bins for sub-script
-    export PLINK_BIN CONVERTF_BIN SMARTPCA_BIN ADMIXTURE_BIN CORES PRUNE TRANSVERSIONS PCA_EVECS RUN_CI
+    export PLINK_BIN CONVERTF_BIN SMARTPCA_BIN ADMIXTURE_BIN CORES PRUNE TRANSVERSIONS PCA_EVECS RUN_CI ADMIX_THREADS ADMIX_PARALLEL ADMIX_KMIN ADMIX_KMAX
     source "${REF_DIR}/../Pipelines/pca_admixture.sh"
 fi
 

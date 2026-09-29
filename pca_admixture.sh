@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Version: 1.2.0
+# Version: 1.3.0
+#   1.3.0 - Admixture: K values run concurrently (ADMIX_PARALLEL jobs at once, ADMIX_THREADS threads each,
+#           default 5 x 16) over K=ADMIX_KMIN..ADMIX_KMAX (default 5..14); CV errors collected in K order.
 #   1.2.0 - options: PCA_EVECS (--pca-evecs, eigenvectors written by smartpca, default 10) and RUN_CI
 #           (--ci true|false, skip the confidence-ellipse smartpca run). Fixed CI evec labelling, which
 #           read a non-existent file and aborted the script; it now writes <prefix>_CI_labeled.evec.
@@ -19,6 +21,10 @@ set -euo pipefail
 : "${TRANSVERSIONS:=false}"
 : "${PCA_EVECS:=10}"
 : "${RUN_CI:=true}"
+: "${ADMIX_THREADS:=16}"
+: "${ADMIX_PARALLEL:=5}"
+: "${ADMIX_KMIN:=5}"
+: "${ADMIX_KMAX:=14}"
 TV_SUFFIX=""
 
 # ======== Logger and Software Discovery ========
@@ -299,11 +305,33 @@ if [[ "$PLOT" == "admixture" || "$PLOT" == "both" ]]; then
     ADMIX_INPUT="$(realpath "${PAR_PREFIX}.bed")"
     ADMIX_FAM="$(realpath "${PAR_PREFIX}.fam")"
 
-    log_msg "Running Admixture for K=5 to 14..."
+    log_msg "Running Admixture for K=${ADMIX_KMIN} to ${ADMIX_KMAX} (${ADMIX_PARALLEL} at a time, ${ADMIX_THREADS} threads each)..."
+    declare -A ADMIX_PID=()
+    ADMIX_FAILED=0
+    for k in $(seq "$ADMIX_KMIN" "$ADMIX_KMAX"); do
+        # wait for a free slot
+        while (( $(jobs -rp | wc -l) >= ADMIX_PARALLEL )); do
+            wait -n || true
+        done
+        log_msg "  Starting K=$k"
+        (cd "$ADMIXTURE_DIR" && "$ADMIXTURE_BIN" -j"${ADMIX_THREADS}" --cv "$ADMIX_INPUT" "$k") > "${ADMIXTURE_DIR}/admixture_K${k}.log" 2>&1 &
+        ADMIX_PID[$k]=$!
+    done
+    for k in "${!ADMIX_PID[@]}"; do
+        if wait "${ADMIX_PID[$k]}"; then
+            log_msg "  Finished K=$k"
+        else
+            log_msg "  ERROR: Admixture failed for K=$k (see ${ADMIXTURE_DIR}/admixture_K${k}.log)"
+            ADMIX_FAILED=1
+        fi
+    done
+    if [[ "$ADMIX_FAILED" -ne 0 ]]; then
+        exit 1
+    fi
+
+    # CV errors in K order
     : > "${ADMIXTURE_DIR}/cv_comparison.txt"
-    for k in {5..14}; do
-        log_msg "  Processing K=$k"
-        (cd "$ADMIXTURE_DIR" && "$ADMIXTURE_BIN" -j"${CORES}" --cv "$ADMIX_INPUT" "$k") > "${ADMIXTURE_DIR}/admixture_K${k}.log" 2>&1
+    for k in $(seq "$ADMIX_KMIN" "$ADMIX_KMAX"); do
         grep '^CV error' "${ADMIXTURE_DIR}/admixture_K${k}.log" >> "${ADMIXTURE_DIR}/cv_comparison.txt" || true
     done
 
