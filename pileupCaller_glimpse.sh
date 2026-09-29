@@ -1,11 +1,14 @@
 #!/bin/bash
-# Version: 1.0.1
+# Version: 1.2.0
+#   1.2.0 - new --pca-evecs N (default 10) and --ci true|false (default true).
+#   1.1.1 - ldprio v1.5 compatible (see pca_admixture.sh).
+#   1.1.0 - new --transversions true|false: restrict PCA/Admixture to transversion SNPs.
 #   1.0.1 - fixed admixture/PCA prefix bugs with --prune ldprio|indep, single seed shared by all
 #           pileupCaller outputs, --cores option (replaces hard-coded threads), safe config
 #           loader (no eval), input validation, exported log_msg in all variants.
 #   1.0.0 - initial tagged release (see OLD_VERSION_SCRIPTS/)
 set -euo pipefail
-VERSION="1.0.1"
+VERSION="1.2.0"
 
 # ======== Logger setup ========
 LOG_FILE="pipeline_$(date +%Y%m%d_%H%M%S).log"
@@ -82,6 +85,9 @@ THREADS=2      # threads per GLIMPSE chunk job
 CORES=24       # total cores for samtools, bcftools, smartpca and admixture
 PRUNE="ldprio"
 SEED=12345     # one seed shared by all pileupCaller runs so EIGENSTRAT/PLINK/VCF agree
+TRANSVERSIONS="false"
+PCA_EVECS=10
+RUN_CI="true"
 export CORES PRUNE
 
 while [[ $# -gt 0 ]]; do
@@ -96,9 +102,12 @@ while [[ $# -gt 0 ]]; do
         --cores)     CORES="$2";      shift 2 ;;
         --prune)     PRUNE="$2";      shift 2 ;;
         --seed)      SEED="$2";       shift 2 ;;
+        --transversions) TRANSVERSIONS="$2"; shift 2 ;;
+        --pca-evecs) PCA_EVECS="$2"; shift 2 ;;
+        --ci)        RUN_CI="$2";    shift 2 ;;
         --version)   echo "$VERSION"; exit 0 ;;
         --help)
-            echo "Usage: $0 --input file.txt --pseudoHap true|false --panel twist|wgs --impute true|false --plot false|pca|admixture|both --xchr true|false --prune indep|ldprio --threads 2 --cores 24 --seed 12345 [--version]"
+            echo "Usage: $0 --input file.txt --pseudoHap true|false --panel twist|wgs --impute true|false --plot false|pca|admixture|both --xchr true|false --prune indep|ldprio --threads 2 --cores 24 --seed 12345 --transversions true|false --pca-evecs 10 --ci true|false [--version]"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -108,6 +117,9 @@ done
 # Validate option values
 case "$PLOT"  in false|pca|admixture|both) ;; *) log_msg "Error: --plot must be false|pca|admixture|both"; exit 1 ;; esac
 case "$PRUNE" in indep|ldprio) ;;             *) log_msg "Error: --prune must be indep|ldprio"; exit 1 ;; esac
+case "$RUN_CI" in true|false) ;; *) log_msg "Error: --ci must be true|false"; exit 1 ;; esac
+[[ "$PCA_EVECS" =~ ^[0-9]+$ && "$PCA_EVECS" -ge 2 ]] || { log_msg "Error: --pca-evecs must be an integer >= 2"; exit 1; }
+case "$TRANSVERSIONS" in true|false) ;; *) log_msg "Error: --transversions must be true|false"; exit 1 ;; esac
 case "$PANEL" in wgs|twist) ;;                *) log_msg "Error: --panel must be twist|wgs"; exit 1 ;; esac
 
 # STEP 2: Validate input/config file
@@ -423,7 +435,7 @@ if [[ "$IMPUTE" == "true" ]]; then
 if [[ "$PLOT" != "false" ]]; then
     log_msg "Launching PCA/Admixture analysis..."
     # Export discovered bins for sub-script
-    export PLINK_BIN CONVERTF_BIN SMARTPCA_BIN ADMIXTURE_BIN CORES PRUNE
+    export PLINK_BIN CONVERTF_BIN SMARTPCA_BIN ADMIXTURE_BIN CORES PRUNE TRANSVERSIONS PCA_EVECS RUN_CI
     source "${REF_DIR}/../Pipelines/pca_admixture.sh"
 fi
 
