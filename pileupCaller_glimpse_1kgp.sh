@@ -1,5 +1,7 @@
 #!/bin/bash
-# Version: 1.3.0 (1000 Genomes-only GLIMPSE2 reference panel; chrX still uses hgdp1kgp)
+# Version: 1.4.0 (1000 Genomes-only GLIMPSE2 reference panel; chrX still uses hgdp1kgp)
+#   1.4.0 - new --artefact yes|no (default no): writes <sample>_ancestry_viewer.html, an interactive PCA + ADMIXTURE page
+#           (make_ancestry_viewer.py).
 #   1.3.0 - Admixture runs K values concurrently: --admix-threads (16), --admix-parallel (5), --kmin (5), --kmax (14).
 #   1.2.0 - new --pca-evecs N (default 10) and --ci true|false (default true).
 #   1.1.1 - ldprio v1.5 compatible (see pca_admixture.sh).
@@ -9,7 +11,7 @@
 #           loader (no eval), input validation, exported log_msg in all variants.
 #   1.0.0 - initial tagged release (see OLD_VERSION_SCRIPTS/)
 set -euo pipefail
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 # ======== Logger setup ========
 LOG_FILE="pipeline_$(date +%Y%m%d_%H%M%S).log"
@@ -93,6 +95,7 @@ ADMIX_THREADS=16
 ADMIX_PARALLEL=5
 ADMIX_KMIN=5
 ADMIX_KMAX=14
+ARTEFACT="no"
 export CORES PRUNE
 
 while [[ $# -gt 0 ]]; do
@@ -114,9 +117,10 @@ while [[ $# -gt 0 ]]; do
         --admix-parallel) ADMIX_PARALLEL="$2"; shift 2 ;;
         --kmin)      ADMIX_KMIN="$2"; shift 2 ;;
         --kmax)      ADMIX_KMAX="$2"; shift 2 ;;
+        --artefact)  ARTEFACT="$2";  shift 2 ;;
         --version)   echo "$VERSION"; exit 0 ;;
         --help)
-            echo "Usage: $0 --input file.txt --pseudoHap true|false --panel twist|wgs --impute true|false --plot false|pca|admixture|both --xchr true|false --prune indep|ldprio --threads 2 --cores 24 --seed 12345 --transversions true|false --pca-evecs 10 --ci true|false --admix-threads 16 --admix-parallel 5 --kmin 5 --kmax 14 [--version]"
+            echo "Usage: $0 --input file.txt --pseudoHap true|false --panel twist|wgs --impute true|false --plot false|pca|admixture|both --xchr true|false --prune indep|ldprio --threads 2 --cores 24 --seed 12345 --transversions true|false --pca-evecs 10 --ci true|false --admix-threads 16 --admix-parallel 5 --kmin 5 --kmax 14 --artefact yes|no [--version]"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -130,6 +134,7 @@ for v in ADMIX_THREADS ADMIX_PARALLEL ADMIX_KMIN ADMIX_KMAX; do
     [[ "${!v}" =~ ^[0-9]+$ && "${!v}" -ge 1 ]] || { log_msg "Error: $v must be a positive integer"; exit 1; }
 done
 (( ADMIX_KMIN >= 2 && ADMIX_KMIN <= ADMIX_KMAX )) || { log_msg "Error: need 2 <= --kmin <= --kmax"; exit 1; }
+case "$ARTEFACT" in yes|no) ;; *) log_msg "Error: --artefact must be yes|no"; exit 1 ;; esac
 case "$RUN_CI" in true|false) ;; *) log_msg "Error: --ci must be true|false"; exit 1 ;; esac
 [[ "$PCA_EVECS" =~ ^[0-9]+$ && "$PCA_EVECS" -ge 2 ]] || { log_msg "Error: --pca-evecs must be an integer >= 2"; exit 1; }
 case "$TRANSVERSIONS" in true|false) ;; *) log_msg "Error: --transversions must be true|false"; exit 1 ;; esac
@@ -450,6 +455,32 @@ if [[ "$PLOT" != "false" ]]; then
     # Export discovered bins for sub-script
     export PLINK_BIN CONVERTF_BIN SMARTPCA_BIN ADMIXTURE_BIN CORES PRUNE TRANSVERSIONS PCA_EVECS RUN_CI ADMIX_THREADS ADMIX_PARALLEL ADMIX_KMIN ADMIX_KMAX
     source "${REF_DIR}/../Pipelines/pca_admixture.sh"
+fi
+
+# ======== PART 4: Interactive results page (optional) ========
+if [[ "$ARTEFACT" == "yes" ]]; then
+    if [[ "$PLOT" == "false" || "$PLOT" == "admixture" ]]; then
+        log_msg "Skipping results page: it needs the PCA results (use --plot pca or both)."
+    else
+        log_msg "Creating interactive PCA/ADMIXTURE results page..."
+        VIEWER_PY="${REF_DIR}/../Pipelines/make_ancestry_viewer.py"
+        [[ "$TRANSVERSIONS" == "true" ]] && VIEWER_SUFFIX="_tv" || VIEWER_SUFFIX=""
+        VIEWER_FIDS=()
+        [[ "$PSEUDOHAP" == "true" ]] && VIEWER_FIDS+=("pseudo")
+        [[ "$IMPUTE" == "true" ]] && VIEWER_FIDS+=("imputed")
+        IFS=',' read -r -a VIEWER_NAMES <<< "$SAMPLE_NAME"
+        for vfid in "${VIEWER_FIDS[@]}"; do
+            for vname in "${VIEWER_NAMES[@]}"; do
+                vout="${vname}_ancestry_viewer.html"
+                (( ${#VIEWER_FIDS[@]} > 1 )) && vout="${vname}_${vfid}_ancestry_viewer.html"
+                if python3 "$VIEWER_PY" . --suffix "$VIEWER_SUFFIX" --sample "${vfid}:${vname}" --out "$vout" &>> "$LOG_FILE"; then
+                    log_msg "✅ Results page written: $vout"
+                else
+                    log_msg "WARNING: could not create the results page for ${vfid}:${vname} (see $LOG_FILE)"
+                fi
+            done
+        done
+    fi
 fi
 
 log_msg "Pipeline execution finished."
